@@ -1,32 +1,34 @@
 
 """
-================================================================
+====================================================================
 GENEWEAVER - GPU-ACCELERATED CRISPR ALIGNMENT ENGINE
-================================================================
+====================================================================
 
-COMMIT 1: CPU BASELINE ALIGNMENT ENGINE
+COMMIT 2: ADVANCED GENOMIC PREPROCESSING AND STREAMING
 
-Implemented features:
-1. FASTA genomic sequence parser
-2. Leading comment and whitespace handling
-3. Multiple FASTA record support
-4. DNA sequence validation
-5. Genome chunking with overlap
-6. SpCas9 NGG PAM recognition
-7. Forward and reverse strand scanning
-8. Mismatch detection and position tracking
-9. Duplicate candidate prevention
-10. CPU performance benchmarking
-11. CSV report generation
-12. Command-line interface
+Features:
+1. Streaming FASTA parser
+2. Bounded-memory genomic chunk processing
+3. Multiple FASTA chromosome support
+4. DNA normalization and validation
+5. Ambiguous nucleotide detection
+6. Overlapping genomic chunks
+7. SpCas9 NGG PAM recognition
+8. Forward and reverse strand alignment
+9. Mismatch position analysis
+10. PAM-proximal seed mismatch analysis
+11. GC-content calculation
+12. Computational candidate scoring
+13. Duplicate prevention
+14. CPU performance statistics
+15. Detailed CSV export
 
-Coordinates:
-Zero-based, end-exclusive.
+Coordinates: Zero-based, end-exclusive.
 
-Note:
-This is an experimental off-target candidate screening
-system, not a clinically validated mutation predictor.
-================================================================
+DISCLAIMER:
+Candidate scores are computational screening priorities,
+not experimentally validated biological risk probabilities.
+====================================================================
 """
 
 import argparse
@@ -41,12 +43,12 @@ from pathlib import Path
 from typing import Iterator, List, Tuple
 
 
-# ================================================================
+# ====================================================================
 # 1. CONFIGURATION
-# ================================================================
+# ====================================================================
 
 APP_NAME = "GeneWeaver"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 GUIDE_LENGTH = 20
 PAM_LENGTH = 3
@@ -55,12 +57,15 @@ WINDOW_LENGTH = GUIDE_LENGTH + PAM_LENGTH
 DEFAULT_CHUNK_SIZE = 1_000_000
 DEFAULT_MAX_MISMATCHES = 3
 
+# PAM-proximal seed region in the 20-base protospacer.
+SEED_START_POSITION = 11
+
 VALID_BASES = set("ACGT")
 
 
-# ================================================================
+# ====================================================================
 # 2. LOGGING
-# ================================================================
+# ====================================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,9 +76,9 @@ logging.basicConfig(
 logger = logging.getLogger(APP_NAME)
 
 
-# ================================================================
+# ====================================================================
 # 3. DATA STRUCTURES
-# ================================================================
+# ====================================================================
 
 @dataclass
 class GenomeChunk:
@@ -81,6 +86,10 @@ class GenomeChunk:
     sequence: str
     start_position: int
     end_position: int
+
+    # Number of starting positions owned by this chunk.
+    # Remaining positions belong to the next overlapping chunk.
+    valid_starts: int
 
 
 @dataclass
@@ -93,12 +102,16 @@ class OffTargetResult:
     pam_sequence: str
     mismatch_count: int
     mismatch_positions: str
-    risk_category: str
+    seed_mismatches: int
+    gc_content: float
+    candidate_score: float
+    priority: str
 
 
 @dataclass
 class ScanStatistics:
     total_bases: int = 0
+    ambiguous_bases: int = 0
     total_chunks: int = 0
     total_windows: int = 0
     valid_pam_sites: int = 0
@@ -106,14 +119,11 @@ class ScanStatistics:
     execution_time: float = 0.0
 
 
-# ================================================================
+# ====================================================================
 # 4. DNA UTILITIES
-# ================================================================
+# ====================================================================
 
 def reverse_complement(sequence: str) -> str:
-    """
-    Return the reverse complement of a DNA sequence.
-    """
 
     complement = str.maketrans(
         "ACGTN",
@@ -124,25 +134,21 @@ def reverse_complement(sequence: str) -> str:
 
 
 def validate_guide_rna(guide: str) -> str:
-    """
-    Validate a 20-base CRISPR guide sequence.
-
-    U is converted to T.
-    """
 
     guide = guide.strip().upper().replace("U", "T")
 
     if len(guide) != GUIDE_LENGTH:
+
         raise ValueError(
-            f"Guide must contain exactly {GUIDE_LENGTH} bases. "
-            f"Received {len(guide)} bases."
+            f"Guide must contain exactly {GUIDE_LENGTH} bases."
         )
 
     invalid = set(guide) - VALID_BASES
 
     if invalid:
+
         raise ValueError(
-            f"Invalid DNA bases in guide: {invalid}"
+            f"Invalid guide bases: {invalid}"
         )
 
     return guide
@@ -152,8 +158,8 @@ def clean_dna_sequence(sequence: str) -> str:
     """
     Normalize DNA sequence.
 
-    Invalid bases are converted to N.
-    Their positions are preserved.
+    Invalid characters are converted to N.
+    Coordinates are preserved.
     """
 
     sequence = sequence.upper().replace("U", "T")
@@ -166,24 +172,51 @@ def clean_dna_sequence(sequence: str) -> str:
     )
 
 
-# ================================================================
-# 5. GENOMIC FASTA PARSER
-# ================================================================
+def calculate_gc_content(sequence: str) -> float:
+    """
+    Calculate GC percentage.
+
+    Ambiguous bases are excluded from the denominator.
+    """
+
+    valid_bases = [
+        base for base in sequence
+        if base in VALID_BASES
+    ]
+
+    if not valid_bases:
+        return 0.0
+
+    gc_count = sum(
+        base in ("G", "C")
+        for base in valid_bases
+    )
+
+    return round(
+        gc_count / len(valid_bases) * 100,
+        2
+    )
+
+
+# ====================================================================
+# 5. STREAMING FASTA PARSER
+# ====================================================================
 
 class GenomicParser:
     """
-    Custom FASTA parser.
+    Memory-conscious FASTA parser.
 
-    Does not depend on BioPython's FASTA parser.
+    Reads sequence lines progressively instead of loading
+    an entire chromosome into memory.
 
     Supports:
+    - Multiple chromosome records
     - Leading comments
     - Blank lines
-    - Multiple chromosome records
     - UTF-8 BOM
-    - Lowercase DNA sequences
-    - Ambiguous DNA characters
-    - Chunk generation
+    - Lowercase sequences
+    - Ambiguous nucleotides
+    - Overlapping chunks
     """
 
     def __init__(self, fasta_path: str):
@@ -191,49 +224,82 @@ class GenomicParser:
         self.fasta_path = Path(fasta_path)
 
         if not self.fasta_path.exists():
+
             raise FileNotFoundError(
                 f"FASTA file not found: {self.fasta_path}"
             )
 
         if not self.fasta_path.is_file():
+
             raise ValueError(
                 "Provided path is not a file."
             )
 
         if self.fasta_path.stat().st_size == 0:
+
             raise ValueError(
                 "FASTA file is empty."
             )
 
-    def parse(self) -> Iterator[Tuple[str, str]]:
+        self.total_bases = 0
+        self.ambiguous_bases = 0
+        self.record_count = 0
+
+    def parse_chunks(
+        self,
+        chunk_size: int = DEFAULT_CHUNK_SIZE
+    ) -> Iterator[GenomeChunk]:
         """
-        Read FASTA records manually.
+        Stream FASTA records directly into genomic chunks.
 
-        Each record is returned as:
-            chromosome_name, DNA_sequence
+        Each full chunk retains WINDOW_LENGTH - 1 bases
+        as overlap for the next chunk.
 
-        The parser avoids BioPython parser errors.
+        Every genomic window is assigned to exactly one
+        chunk using valid_starts.
         """
 
-        logger.info(
-            "Reading FASTA file: %s",
-            self.fasta_path
-        )
+        if chunk_size < WINDOW_LENGTH:
 
-        chromosome = None
-        sequence_parts = []
-        record_count = 0
-
-        def finish_record():
-
-            sequence = clean_dna_sequence(
-                "".join(sequence_parts)
+            raise ValueError(
+                f"Chunk size must be at least {WINDOW_LENGTH}."
             )
 
-            if not sequence:
+        overlap = WINDOW_LENGTH - 1
+
+        step = chunk_size - overlap
+
+        chromosome = None
+
+        buffer = ""
+
+        chunk_start = 0
+
+        def emit_final_chunk():
+
+            nonlocal buffer, chunk_start
+
+            if len(buffer) < WINDOW_LENGTH:
                 return None
 
-            return chromosome, sequence
+            valid_starts = (
+                len(buffer) - WINDOW_LENGTH + 1
+            )
+
+            chunk = GenomeChunk(
+                chromosome=chromosome,
+                sequence=buffer,
+                start_position=chunk_start,
+                end_position=chunk_start + len(buffer),
+                valid_starts=valid_starts
+            )
+
+            return chunk
+
+        logger.info(
+            "Starting streaming FASTA preprocessing: %s",
+            self.fasta_path
+        )
 
         try:
 
@@ -249,135 +315,114 @@ class GenomicParser:
 
                     line = line.strip()
 
-                    # Ignore blank lines.
                     if not line:
                         continue
 
-                    # Ignore comment lines.
+                    # Ignore comments.
                     if line.startswith(("#", ";", "!")):
                         continue
 
-                    # Process a new FASTA record.
+                    # New chromosome record.
                     if line.startswith(">"):
 
-                        # Save the previous record.
+                        # Flush the previous chromosome.
                         if chromosome is not None:
 
-                            result = finish_record()
+                            final_chunk = emit_final_chunk()
 
-                            if result is not None:
-
-                                record_count += 1
-
-                                logger.info(
-                                    "Parsed chromosome: %s | Length: %s bases",
-                                    result[0],
-                                    f"{len(result[1]):,}"
-                                )
-
-                                yield result
+                            if final_chunk is not None:
+                                yield final_chunk
 
                         header = line[1:].strip()
 
                         if not header:
+
                             raise ValueError(
                                 f"Empty FASTA header at line {line_number}."
                             )
 
                         chromosome = header.split()[0]
 
-                        sequence_parts = []
+                        self.record_count += 1
 
-                    else:
-
-                        # Ignore content before first FASTA header.
-                        if chromosome is None:
-                            continue
-
-                        sequence_parts.append(
-                            re.sub(r"\s+", "", line)
+                        logger.info(
+                            "Processing chromosome: %s",
+                            chromosome
                         )
 
-            # Process the final record.
-            if chromosome is not None:
+                        buffer = ""
 
-                result = finish_record()
+                        chunk_start = 0
 
-                if result is not None:
+                        continue
 
-                    record_count += 1
+                    # Ignore text before the first FASTA header.
+                    if chromosome is None:
+                        continue
 
-                    logger.info(
-                        "Parsed chromosome: %s | Length: %s bases",
-                        result[0],
-                        f"{len(result[1]):,}"
+                    cleaned = clean_dna_sequence(line)
+
+                    self.total_bases += len(cleaned)
+
+                    self.ambiguous_bases += sum(
+                        base == "N"
+                        for base in cleaned
                     )
 
-                    yield result
+                    buffer += cleaned
+
+                    # Emit chunks whenever enough sequence is available.
+                    while len(buffer) >= chunk_size:
+
+                        chunk = GenomeChunk(
+                            chromosome=chromosome,
+                            sequence=buffer[:chunk_size],
+                            start_position=chunk_start,
+                            end_position=chunk_start + chunk_size,
+                            valid_starts=step
+                        )
+
+                        yield chunk
+
+                        # Preserve overlap for the next chunk.
+                        buffer = buffer[step:]
+
+                        chunk_start += step
+
+            # Flush the final chromosome.
+            if chromosome is not None:
+
+                final_chunk = emit_final_chunk()
+
+                if final_chunk is not None:
+                    yield final_chunk
+
+            if self.record_count == 0:
+
+                raise ValueError(
+                    "No valid FASTA records found."
+                )
 
         except UnicodeDecodeError as error:
 
             raise ValueError(
                 "Unable to decode FASTA file. "
-                "Please provide a UTF-8 encoded file."
+                "Use a UTF-8 encoded FASTA file."
             ) from error
 
-        if record_count == 0:
-            raise ValueError(
-                "No valid FASTA records found. "
-                "Check that your file contains headers beginning with >."
-            )
 
-    def generate_chunks(
-        self,
-        sequence: str,
-        chromosome: str,
-        chunk_size: int = DEFAULT_CHUNK_SIZE
-    ) -> Iterator[GenomeChunk]:
-        """
-        Generate overlapping genomic chunks.
-
-        Overlap prevents missing candidate windows
-        that cross chunk boundaries.
-        """
-
-        if chunk_size < WINDOW_LENGTH:
-            raise ValueError(
-                f"Chunk size must be at least {WINDOW_LENGTH}."
-            )
-
-        overlap = WINDOW_LENGTH - 1
-
-        step = chunk_size - overlap
-
-        for start in range(0, len(sequence), step):
-
-            end = min(
-                start + chunk_size,
-                len(sequence)
-            )
-
-            yield GenomeChunk(
-                chromosome=chromosome,
-                sequence=sequence[start:end],
-                start_position=start,
-                end_position=end
-            )
-
-
-# ================================================================
+# ====================================================================
 # 6. CPU ALIGNMENT ENGINE
-# ================================================================
+# ====================================================================
 
 class CPUAlignmentEngine:
     """
-    CPU-based CRISPR off-target candidate scanner.
+    CPU baseline CRISPR alignment engine.
 
-    Search pattern:
+    Searches:
+        20-base protospacer + NGG PAM
 
-        20-base target + NGG PAM
-
-    Both forward and reverse DNA strands are examined.
+    Both genomic orientations are examined.
     """
 
     def __init__(
@@ -391,6 +436,7 @@ class CPUAlignmentEngine:
         )
 
         if not 0 <= max_mismatches <= GUIDE_LENGTH:
+
             raise ValueError(
                 "Maximum mismatches must be between 0 and 20."
             )
@@ -401,17 +447,12 @@ class CPUAlignmentEngine:
 
         self.results: List[OffTargetResult] = []
 
-        self._seen_sites = set()
-
-    # ------------------------------------------------------------
+    # ----------------------------------------------------------------
     # PAM VALIDATION
-    # ------------------------------------------------------------
+    # ----------------------------------------------------------------
 
     @staticmethod
     def is_valid_pam(pam: str) -> bool:
-        """
-        Validate canonical SpCas9 NGG PAM.
-        """
 
         return (
             len(pam) == PAM_LENGTH
@@ -419,59 +460,88 @@ class CPUAlignmentEngine:
             and pam[1:] == "GG"
         )
 
-    # ------------------------------------------------------------
-    # MISMATCH CALCULATION
-    # ------------------------------------------------------------
+    # ----------------------------------------------------------------
+    # MISMATCH ANALYSIS
+    # ----------------------------------------------------------------
 
     def calculate_mismatches(
         self,
         target: str
     ) -> Tuple[int, List[int]]:
-        """
-        Calculate mismatches between guide and target.
 
-        Positions are reported using 1-based indexing.
-        """
-
-        mismatch_positions = []
+        positions = []
 
         for index in range(GUIDE_LENGTH):
 
             if self.guide[index] != target[index]:
 
-                mismatch_positions.append(index + 1)
+                positions.append(index + 1)
 
-        return (
-            len(mismatch_positions),
-            mismatch_positions
-        )
+        return len(positions), positions
 
-    # ------------------------------------------------------------
-    # CANDIDATE PRIORITY
-    # ------------------------------------------------------------
+    # ----------------------------------------------------------------
+    # SEED REGION ANALYSIS
+    # ----------------------------------------------------------------
 
     @staticmethod
-    def classify_candidate(mismatches: int) -> str:
+    def calculate_seed_mismatches(
+        mismatch_positions: List[int]
+    ) -> int:
         """
-        Assign computational screening categories.
+        Count mismatches in guide positions 11-20.
 
-        These are not experimentally validated risk scores.
+        This represents the PAM-proximal seed region
+        under the orientation convention used here.
         """
 
-        if mismatches == 0:
-            return "Exact Match"
+        return sum(
+            position >= SEED_START_POSITION
+            for position in mismatch_positions
+        )
 
-        if mismatches == 1:
-            return "High Priority"
+    # ----------------------------------------------------------------
+    # CANDIDATE SCORING
+    # ----------------------------------------------------------------
 
-        if mismatches == 2:
-            return "Medium Priority"
+    @staticmethod
+    def calculate_candidate_score(
+        mismatch_count: int,
+        seed_mismatches: int
+    ) -> float:
+        """
+        Heuristic computational priority score.
 
-        return "Lower Priority"
+        This is not a biological probability.
+        """
 
-    # ------------------------------------------------------------
-    # CHUNK SCANNING
-    # ------------------------------------------------------------
+        score = (
+            100
+            - (mismatch_count * 15)
+            - (seed_mismatches * 5)
+        )
+
+        return round(
+            max(0.0, min(100.0, score)),
+            2
+        )
+
+    @staticmethod
+    def classify_candidate(score: float) -> str:
+
+        if score >= 85:
+            return "Priority 1"
+
+        if score >= 65:
+            return "Priority 2"
+
+        if score >= 40:
+            return "Priority 3"
+
+        return "Priority 4"
+
+    # ----------------------------------------------------------------
+    # CHUNK ALIGNMENT
+    # ----------------------------------------------------------------
 
     def scan_chunk(
         self,
@@ -480,8 +550,6 @@ class CPUAlignmentEngine:
 
         chunk_results = []
 
-        sequence_length = len(chunk.sequence)
-
         orientations = [
             ("+", chunk.sequence),
             ("-", reverse_complement(chunk.sequence))
@@ -489,11 +557,12 @@ class CPUAlignmentEngine:
 
         for strand, oriented_sequence in orientations:
 
-            last_start = (
-                len(oriented_sequence) - WINDOW_LENGTH
+            maximum_starts = min(
+                chunk.valid_starts,
+                len(oriented_sequence) - WINDOW_LENGTH + 1
             )
 
-            for index in range(last_start + 1):
+            for index in range(maximum_starts):
 
                 self.statistics.total_windows += 1
 
@@ -506,18 +575,26 @@ class CPUAlignmentEngine:
                     index + WINDOW_LENGTH
                 ]
 
-                # Reject ambiguous DNA windows.
+                # Reject ambiguous target and PAM sequences.
                 if not (
                     all(base in VALID_BASES for base in target)
                     and all(base in VALID_BASES for base in pam)
                 ):
                     continue
 
-                # Check SpCas9 PAM.
                 if not self.is_valid_pam(pam):
                     continue
 
-                # Calculate reference coordinates.
+                self.statistics.valid_pam_sites += 1
+
+                mismatch_count, mismatch_positions = (
+                    self.calculate_mismatches(target)
+                )
+
+                if mismatch_count > self.max_mismatches:
+                    continue
+
+                # Calculate reference genome coordinates.
                 if strand == "+":
 
                     genomic_start = (
@@ -528,34 +605,33 @@ class CPUAlignmentEngine:
 
                     genomic_start = (
                         chunk.start_position
-                        + sequence_length
-                        - (index + WINDOW_LENGTH)
+                        + len(chunk.sequence)
+                        - index
+                        - WINDOW_LENGTH
                     )
 
                 genomic_end = (
                     genomic_start + WINDOW_LENGTH
                 )
 
-                # Prevent duplicate sites at chunk boundaries.
-                unique_key = (
-                    chunk.chromosome,
-                    genomic_start,
-                    strand
+                seed_mismatches = (
+                    self.calculate_seed_mismatches(
+                        mismatch_positions
+                    )
                 )
 
-                if unique_key in self._seen_sites:
-                    continue
-
-                self._seen_sites.add(unique_key)
-
-                self.statistics.valid_pam_sites += 1
-
-                mismatch_count, mismatch_positions = (
-                    self.calculate_mismatches(target)
+                gc_content = calculate_gc_content(
+                    target
                 )
 
-                if mismatch_count > self.max_mismatches:
-                    continue
+                score = self.calculate_candidate_score(
+                    mismatch_count,
+                    seed_mismatches
+                )
+
+                priority = self.classify_candidate(
+                    score
+                )
 
                 result = OffTargetResult(
                     chromosome=chunk.chromosome,
@@ -568,9 +644,10 @@ class CPUAlignmentEngine:
                     mismatch_positions=",".join(
                         map(str, mismatch_positions)
                     ),
-                    risk_category=self.classify_candidate(
-                        mismatch_count
-                    )
+                    seed_mismatches=seed_mismatches,
+                    gc_content=gc_content,
+                    candidate_score=score,
+                    priority=priority
                 )
 
                 chunk_results.append(result)
@@ -581,40 +658,32 @@ class CPUAlignmentEngine:
 
         return chunk_results
 
-    # ------------------------------------------------------------
-    # COMPLETE GENOME SCANNING
-    # ------------------------------------------------------------
+    # ----------------------------------------------------------------
+    # COMPLETE GENOME SCAN
+    # ----------------------------------------------------------------
 
     def scan_genome(
         self,
         fasta_path: str,
         chunk_size: int = DEFAULT_CHUNK_SIZE
     ) -> List[OffTargetResult]:
-        """
-        Execute the complete CPU baseline scan.
-        """
-
-        if chunk_size < WINDOW_LENGTH:
-            raise ValueError(
-                f"Chunk size must be at least {WINDOW_LENGTH}."
-            )
 
         parser = GenomicParser(fasta_path)
 
-        # Reset previous scan state.
         self.statistics = ScanStatistics()
 
         self.results = []
 
-        self._seen_sites.clear()
-
         start_time = time.perf_counter()
 
         logger.info("=" * 65)
-        logger.info("GENEWEAVER CPU ALIGNMENT ENGINE")
+        logger.info("GENEWEAVER STREAMING ALIGNMENT ENGINE")
         logger.info("=" * 65)
 
-        logger.info("Version: %s", VERSION)
+        logger.info(
+            "Version: %s",
+            VERSION
+        )
 
         logger.info(
             "Guide RNA: %s",
@@ -631,65 +700,67 @@ class CPUAlignmentEngine:
             f"{chunk_size:,}"
         )
 
-        logger.info("Starting genomic scan...")
+        logger.info(
+            "Streaming preprocessing enabled."
+        )
 
-        for chromosome, sequence in parser.parse():
+        logger.info(
+            "Starting genomic alignment..."
+        )
 
-            self.statistics.total_bases += len(sequence)
+        for chunk in parser.parse_chunks(chunk_size):
 
-            logger.info(
-                "Scanning chromosome: %s",
-                chromosome
-            )
+            self.statistics.total_chunks += 1
 
-            for chunk in parser.generate_chunks(
-                sequence=sequence,
-                chromosome=chromosome,
-                chunk_size=chunk_size
+            chunk_results = self.scan_chunk(chunk)
+
+            self.results.extend(chunk_results)
+
+            if (
+                self.statistics.total_chunks == 1
+                or self.statistics.total_chunks % 100 == 0
             ):
 
-                self.statistics.total_chunks += 1
-
-                chunk_results = self.scan_chunk(
-                    chunk
-                )
-
-                self.results.extend(
-                    chunk_results
-                )
-
                 logger.info(
-                    "Processed chunk %d | Candidates found: %d",
+                    "Chunks: %d | Bases read: %s | Candidates: %d",
                     self.statistics.total_chunks,
+                    f"{parser.total_bases:,}",
                     self.statistics.candidate_sites
                 )
+
+        self.statistics.total_bases = parser.total_bases
+
+        self.statistics.ambiguous_bases = (
+            parser.ambiguous_bases
+        )
 
         self.statistics.execution_time = (
             time.perf_counter() - start_time
         )
 
-        logger.info("CPU baseline scan completed.")
+        logger.info(
+            "Streaming genomic alignment completed."
+        )
 
         self.print_statistics()
 
         return self.results
 
-    # ------------------------------------------------------------
-    # PERFORMANCE REPORT
-    # ------------------------------------------------------------
+    # ----------------------------------------------------------------
+    # STATISTICS
+    # ----------------------------------------------------------------
 
     def print_statistics(self):
 
         stats = self.statistics
 
         print("\n")
-        print("=" * 65)
+        print("=" * 68)
         print("                 GENEWEAVER SCAN REPORT")
-        print("=" * 65)
+        print("=" * 68)
 
-        print(
-            f"Guide RNA              : {self.guide}"
-        )
+        print(f"Version                : {VERSION}")
+        print(f"Guide RNA              : {self.guide}")
 
         print(
             f"Maximum mismatches     : {self.max_mismatches}"
@@ -697,6 +768,10 @@ class CPUAlignmentEngine:
 
         print(
             f"Total genomic bases    : {stats.total_bases:,}"
+        )
+
+        print(
+            f"Ambiguous bases        : {stats.ambiguous_bases:,}"
         )
 
         print(
@@ -729,24 +804,20 @@ class CPUAlignmentEngine:
                 f"Processing throughput  : {throughput:,.2f} bases/sec"
             )
 
-        print("=" * 65)
+        print("=" * 68)
 
 
-# ================================================================
+# ====================================================================
 # 7. CSV REPORT GENERATOR
-# ================================================================
+# ====================================================================
 
 def export_results_to_csv(
     results: List[OffTargetResult],
     output_path: str
 ) -> None:
-    """
-    Export off-target candidates into a CSV report.
-    """
 
     output_file = Path(output_path)
 
-    # Create output directory if necessary.
     output_file.parent.mkdir(
         parents=True,
         exist_ok=True
@@ -761,7 +832,10 @@ def export_results_to_csv(
         "pam_sequence",
         "mismatch_count",
         "mismatch_positions",
-        "risk_category"
+        "seed_mismatches",
+        "gc_content",
+        "candidate_score",
+        "priority"
     ]
 
     with output_file.open(
@@ -788,7 +862,10 @@ def export_results_to_csv(
                 "pam_sequence": result.pam_sequence,
                 "mismatch_count": result.mismatch_count,
                 "mismatch_positions": result.mismatch_positions,
-                "risk_category": result.risk_category
+                "seed_mismatches": result.seed_mismatches,
+                "gc_content": result.gc_content,
+                "candidate_score": result.candidate_score,
+                "priority": result.priority
             })
 
     logger.info(
@@ -797,24 +874,23 @@ def export_results_to_csv(
     )
 
 
-# ================================================================
+# ====================================================================
 # 8. COMMAND LINE INTERFACE
-# ================================================================
+# ====================================================================
 
 def create_argument_parser():
 
     parser = argparse.ArgumentParser(
         prog="GeneWeaver",
         description=(
-            "CRISPR off-target candidate detection "
-            "using CPU-based genomic alignment."
+            "Streaming CRISPR off-target alignment engine."
         )
     )
 
     parser.add_argument(
         "--fasta",
         required=True,
-        help="Input FASTA genome file."
+        help="Input FASTA file."
     )
 
     parser.add_argument(
@@ -840,15 +916,15 @@ def create_argument_parser():
     parser.add_argument(
         "--output",
         default="off_target_results.csv",
-        help="Output CSV report path."
+        help="Output CSV report."
     )
 
     return parser
 
 
-# ================================================================
+# ====================================================================
 # 9. MAIN APPLICATION
-# ================================================================
+# ====================================================================
 
 def main():
 
@@ -875,7 +951,7 @@ def main():
 
         print("\n")
         print("=" * 55)
-        print("GENEWEAVER EXECUTION SUCCESSFUL")
+        print("GENEWEAVER COMMIT 2 COMPLETED")
         print("=" * 55)
 
         print(
@@ -888,7 +964,7 @@ def main():
         )
 
         print(
-            f"Report: {Path(args.output).resolve()}"
+            f"CSV report: {Path(args.output).resolve()}"
         )
 
         print("=" * 55)
@@ -908,9 +984,9 @@ def main():
         sys.exit(1)
 
 
-# ================================================================
-# 10. APPLICATION ENTRY POINT
-# ================================================================
+# ====================================================================
+# 10. ENTRY POINT
+# ====================================================================
 
 if __name__ == "__main__":
     main()
