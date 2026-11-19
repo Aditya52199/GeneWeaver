@@ -1,4 +1,5 @@
 
+import gc
 import os
 
 import numpy as np
@@ -13,6 +14,9 @@ from geneweaver import (
     calculate_candidate_score,
     classify_priority,
 )
+
+from gpu_memory import GPUMemoryManager
+
 
 try:
     from numba import cuda
@@ -29,6 +33,12 @@ except Exception as error:
 
 
 THREADS_PER_BLOCK = 128
+DEFAULT_MAX_BATCH_STARTS = 65536
+
+MEMORY_MANAGER = GPUMemoryManager(
+    max_batch_starts=DEFAULT_MAX_BATCH_STARTS,
+    memory_fraction=0.60
+)
 
 
 if NUMBA_CUDA_IMPORTED:
@@ -42,17 +52,6 @@ if NUMBA_CUDA_IMPORTED:
         output_counts,
         output_masks
     ):
-        """
-        One CUDA thread processes one possible 23-base target window.
-
-        output_counts:
-            -1 = PAM not found
-            0 or greater = mismatch count
-
-        output_masks:
-            Bit mask indicating mismatch positions.
-        """
-
         thread_id = cuda.grid(1)
 
         if thread_id >= start_indices.size:
@@ -60,12 +59,11 @@ if NUMBA_CUDA_IMPORTED:
 
         start = start_indices[thread_id]
 
-        # Check the SpCas9 NGG PAM.
+        # Check the canonical SpCas9 NGG PAM.
         pam_first = sequence[start + GUIDE_LENGTH]
         pam_second = sequence[start + GUIDE_LENGTH + 1]
         pam_third = sequence[start + GUIDE_LENGTH + 2]
 
-        # The first PAM position must be a valid DNA base.
         if (
             pam_first != 65
             and pam_first != 67
@@ -89,7 +87,6 @@ if NUMBA_CUDA_IMPORTED:
                 mismatch_count += 1
                 mismatch_mask |= (1 << position)
 
-                # Stop comparing as soon as the limit is exceeded.
                 if mismatch_count > maximum_mismatches:
                     break
 
@@ -102,10 +99,14 @@ def _build_candidate(
     start,
     chunk,
     strand,
+    guide,
     mismatch_count,
     mismatch_mask
 ):
-    target = oriented_sequence[start:start + GUIDE_LENGTH]
+    target = oriented_sequence[
+        start:start + GUIDE_LENGTH
+    ]
+
     pam = oriented_sequence[
         start + GUIDE_LENGTH:start + WINDOW_LENGTH
     ]
@@ -141,7 +142,7 @@ def _build_candidate(
         "start_position": genomic_start,
         "end_position": genomic_start + WINDOW_LENGTH - 1,
         "strand": strand,
-        "guide": None,
+        "guide": guide.decode("ascii"),
         "target": target.decode("ascii"),
         "pam": pam.decode("ascii"),
         "mismatch_count": mismatch_count,
@@ -156,40 +157,31 @@ def _build_candidate(
     }
 
 
-def _scan_orientation_cuda(
-    oriented_sequence,
-    start_indices,
-    chunk,
-    strand,
-    guide,
+def _execute_cuda_batch(
+    sequence_array,
+    guide_array,
+    start_batch,
     maximum_mismatches
 ):
-    if len(start_indices) == 0:
-        return [], 0
+    """
+    Allocate, execute and copy back one bounded CUDA batch.
 
-    sequence_array = np.frombuffer(
-        oriented_sequence,
-        dtype=np.uint8
-    ).copy()
-
-    guide_array = np.frombuffer(
-        guide,
-        dtype=np.uint8
-    ).copy()
-
+    Local device-array references are released when this function
+    returns, allowing the runtime to reclaim temporary buffers.
+    """
     starts_array = np.asarray(
-        start_indices,
+        start_batch,
         dtype=np.int32
     )
 
     output_counts = np.full(
-        len(start_indices),
+        len(start_batch),
         -1,
         dtype=np.int16
     )
 
     output_masks = np.zeros(
-        len(start_indices),
+        len(start_batch),
         dtype=np.uint32
     )
 
@@ -201,7 +193,7 @@ def _scan_orientation_cuda(
     device_masks = cuda.to_device(output_masks)
 
     blocks = (
-        len(start_indices) + THREADS_PER_BLOCK - 1
+        len(start_batch) + THREADS_PER_BLOCK - 1
     ) // THREADS_PER_BLOCK
 
     alignment_kernel[
@@ -221,45 +213,120 @@ def _scan_orientation_cuda(
     result_counts = device_counts.copy_to_host()
     result_masks = device_masks.copy_to_host()
 
+    # Drop references to temporary device buffers.
+    del device_sequence
+    del device_guide
+    del device_starts
+    del device_counts
+    del device_masks
+
+    return result_counts, result_masks
+
+
+def _scan_orientation_cuda(
+    oriented_sequence,
+    start_indices,
+    chunk,
+    strand,
+    guide,
+    maximum_mismatches,
+    max_batch_starts=DEFAULT_MAX_BATCH_STARTS
+):
+    total_windows = len(start_indices)
+
+    if total_windows == 0:
+        return [], 0, {
+            "batch_count": 0,
+            "batch_size": 0,
+            "estimated_memory_bytes": 0
+        }
+
+    manager = GPUMemoryManager(
+        max_batch_starts=max_batch_starts,
+        memory_fraction=0.60
+    )
+
+    memory_plan = manager.plan(
+        sequence_length=len(oriented_sequence),
+        total_windows=total_windows,
+        cuda_module=cuda
+    )
+
+    sequence_array = np.frombuffer(
+        oriented_sequence,
+        dtype=np.uint8
+    ).copy()
+
+    guide_array = np.frombuffer(
+        guide,
+        dtype=np.uint8
+    ).copy()
+
     candidates = []
     valid_pam_sites = 0
+    batches_processed = 0
 
-    for index, start in enumerate(start_indices):
-        mismatch_count = int(result_counts[index])
-
-        if mismatch_count < 0:
-            continue
-
-        valid_pam_sites += 1
-
-        if mismatch_count > maximum_mismatches:
-            continue
-
-        candidate = _build_candidate(
-            oriented_sequence=oriented_sequence,
-            start=start,
-            chunk=chunk,
-            strand=strand,
-            mismatch_count=mismatch_count,
-            mismatch_mask=int(result_masks[index])
+    for start_batch in manager.iter_batches(
+        start_indices,
+        memory_plan.batch_size
+    ):
+        result_counts, result_masks = _execute_cuda_batch(
+            sequence_array=sequence_array,
+            guide_array=guide_array,
+            start_batch=start_batch,
+            maximum_mismatches=maximum_mismatches
         )
 
-        candidate["guide"] = guide.decode("ascii")
-        candidates.append(candidate)
+        batches_processed += 1
 
-    return candidates, valid_pam_sites
+        for index, start in enumerate(start_batch):
+            mismatch_count = int(result_counts[index])
+
+            if mismatch_count < 0:
+                continue
+
+            valid_pam_sites += 1
+
+            if mismatch_count > maximum_mismatches:
+                continue
+
+            candidate = _build_candidate(
+                oriented_sequence=oriented_sequence,
+                start=start,
+                chunk=chunk,
+                strand=strand,
+                guide=guide,
+                mismatch_count=mismatch_count,
+                mismatch_mask=int(result_masks[index])
+            )
+
+            candidates.append(candidate)
+
+        del result_counts
+        del result_masks
+
+        manager.release_host_references()
+
+    memory_statistics = {
+        "batch_count": batches_processed,
+        "batch_size": memory_plan.batch_size,
+        "estimated_memory_bytes": (
+            memory_plan.estimated_memory_per_batch_bytes
+        )
+    }
+
+    return candidates, valid_pam_sites, memory_statistics
 
 
 def scan_chunk_accelerated(
     chunk: GenomicChunk,
     guide: bytes,
-    maximum_mismatches: int
+    maximum_mismatches: int,
+    max_batch_starts=DEFAULT_MAX_BATCH_STARTS
 ):
     """
-    Use CUDA when available.
-
-    Otherwise, automatically use the existing CPU scan_chunk()
-    implementation.
+    Run bounded CUDA batches when CUDA is available.
+    Otherwise, use the existing CPU alignment implementation.
     """
 
     if not CUDA_AVAILABLE:
@@ -269,21 +336,36 @@ def scan_chunk_accelerated(
             maximum_mismatches
         )
 
+        statistics["batch_count"] = 1
+        statistics["batch_size"] = chunk.valid_starts
+
         return {
             "backend": "CPU",
             "candidates": candidates,
             "statistics": statistics,
+            "memory": {
+                "batch_count": 1,
+                "batch_size": chunk.valid_starts,
+                "estimated_memory_bytes": None
+            },
             "message": (
                 "CUDA unavailable. Existing CPU alignment "
                 "implementation was used."
             )
         }
 
-    sequence = chunk.sequence
+    if len(guide) != GUIDE_LENGTH:
+        raise ValueError("Guide must contain exactly 20 bases.")
+
+    if any(base not in b"ACGT" for base in guide):
+        raise ValueError("Guide must contain only A, C, G and T.")
+
+    if not 0 <= maximum_mismatches <= GUIDE_LENGTH:
+        raise ValueError("Invalid maximum mismatch count.")
 
     total_starts = max(
         0,
-        len(sequence) - WINDOW_LENGTH + 1
+        len(chunk.sequence) - WINDOW_LENGTH + 1
     )
 
     valid_starts = min(
@@ -291,34 +373,37 @@ def scan_chunk_accelerated(
         total_starts
     )
 
-    forward_indices = list(range(valid_starts))
+    forward_indices = range(valid_starts)
 
     reverse_first_index = total_starts - valid_starts
-    reverse_indices = list(
-        range(reverse_first_index, total_starts)
+    reverse_indices = range(
+        reverse_first_index,
+        total_starts
     )
 
-    forward_candidates, forward_pam_count = (
+    forward_candidates, forward_pam_count, forward_memory = (
         _scan_orientation_cuda(
-            oriented_sequence=sequence,
+            oriented_sequence=chunk.sequence,
             start_indices=forward_indices,
             chunk=chunk,
             strand="+",
             guide=guide,
-            maximum_mismatches=maximum_mismatches
+            maximum_mismatches=maximum_mismatches,
+            max_batch_starts=max_batch_starts
         )
     )
 
-    reverse_sequence = reverse_complement(sequence)
+    reverse_sequence = reverse_complement(chunk.sequence)
 
-    reverse_candidates, reverse_pam_count = (
+    reverse_candidates, reverse_pam_count, reverse_memory = (
         _scan_orientation_cuda(
             oriented_sequence=reverse_sequence,
             start_indices=reverse_indices,
             chunk=chunk,
             strand="-",
             guide=guide,
-            maximum_mismatches=maximum_mismatches
+            maximum_mismatches=maximum_mismatches,
+            max_batch_starts=max_batch_starts
         )
     )
 
@@ -326,17 +411,29 @@ def scan_chunk_accelerated(
 
     statistics = {
         "chunk_index": chunk.chunk_index,
-        "sequence_length": len(sequence),
+        "sequence_length": len(chunk.sequence),
         "valid_starts": chunk.valid_starts,
         "pam_sites": forward_pam_count + reverse_pam_count,
-        "candidates": len(candidates)
+        "candidates": len(candidates),
+        "batch_count": (
+            forward_memory["batch_count"]
+            + reverse_memory["batch_count"]
+        )
+    }
+
+    memory = {
+        "forward": forward_memory,
+        "reverse": reverse_memory
     }
 
     return {
         "backend": "CUDA",
         "candidates": candidates,
         "statistics": statistics,
-        "message": "Numba CUDA alignment kernel executed."
+        "memory": memory,
+        "message": (
+            "CUDA alignment completed using bounded batches."
+        )
     }
 
 
@@ -350,16 +447,12 @@ def get_backend_status():
         "cuda_import_error": CUDA_IMPORT_ERROR,
         "simulator_enabled": (
             os.environ.get("NUMBA_ENABLE_CUDASIM") == "1"
-        )
+        ),
+        "maximum_batch_starts": DEFAULT_MAX_BATCH_STARTS
     }
 
 
 if __name__ == "__main__":
     import json
 
-    print(
-        json.dumps(
-            get_backend_status(),
-            indent=4
-        )
-    )
+    print(json.dumps(get_backend_status(), indent=4))
