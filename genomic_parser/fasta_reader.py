@@ -3,15 +3,29 @@ BioPython-powered FASTA reader and genomic parsing pipeline for GeneWeaver.
 
 Uses BioPython's Bio.SeqIO engine to stream and parse raw or gzipped
 human genome FASTA files, cleaning sequences and dispatching chunks as NumPy arrays.
+Provides resilient fallback parser if OS AppControl restricts BioPython C extensions.
 """
 
 from dataclasses import dataclass
 import gzip
 import os
-from typing import Generator, Iterator, List, Optional, Tuple, Union
+from typing import Any, Generator, Iterator, List, Optional, Tuple, Union
 
-from Bio import SeqIO
-from Bio.SeqRecord import SeqRecord
+try:
+    from Bio import SeqIO
+    from Bio.SeqRecord import SeqRecord
+    _BIOPYTHON_AVAILABLE = True
+except Exception:
+    _BIOPYTHON_AVAILABLE = False
+
+
+@dataclass
+class SimpleSeqRecord:
+    """Lightweight fallback SeqRecord when BioPython C-extensions are blocked."""
+    id: str
+    description: str
+    seq: str
+
 
 from genomic_parser.metadata_extractor import (
     ChromosomeMetadata,
@@ -60,16 +74,52 @@ class FastaReader:
             return gzip.open(self.file_path, "rt", encoding="utf-8")
         return open(self.file_path, "r", encoding="utf-8")
 
-    def stream_records(self) -> Iterator[SeqRecord]:
+    def _fallback_parse(self, handle) -> Iterator[SimpleSeqRecord]:
+        """Pure-Python FASTA parser generator."""
+        current_id = None
+        current_desc = ""
+        current_seq = []
+
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if current_id is not None:
+                    yield SimpleSeqRecord(
+                        id=current_id,
+                        description=current_desc,
+                        seq="".join(current_seq),
+                    )
+                header = line[1:].strip()
+                parts = header.split(maxsplit=1)
+                current_id = parts[0]
+                current_desc = header
+                current_seq = []
+            else:
+                current_seq.append(line)
+
+        if current_id is not None:
+            yield SimpleSeqRecord(
+                id=current_id,
+                description=current_desc,
+                seq="".join(current_seq),
+            )
+
+    def stream_records(self) -> Iterator[Union[Any, SimpleSeqRecord]]:
         """
-        Stream raw BioPython SeqRecord objects one by one without loading entire file.
+        Stream raw records using BioPython (or fallback parser if C-extension blocked).
 
         Yields:
-            Bio.SeqRecord.SeqRecord objects.
+            SeqRecord or SimpleSeqRecord objects.
         """
         with self._open_handle() as handle:
-            for record in SeqIO.parse(handle, "fasta"):
-                yield record
+            if _BIOPYTHON_AVAILABLE:
+                for record in SeqIO.parse(handle, "fasta"):
+                    yield record
+            else:
+                for record in self._fallback_parse(handle):
+                    yield record
 
     def stream_chromosomes(self) -> Iterator[ParsedChromosome]:
         """
@@ -152,4 +202,3 @@ class GenomePipeline:
     def get_summary(self) -> GenomeMetadata:
         """Get summary metadata for the parsed genome."""
         return self.reader.get_genome_metadata()
-
