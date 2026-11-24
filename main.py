@@ -87,15 +87,23 @@ def main():
         default=100,
         help="Overlap size between chunks (default: 100)",
     )
+    parser.add_argument(
+        "--dashboard", "--tui",
+        action="store_true",
+        help="Launch the interactive Textual terminal dashboard",
+    )
     args = parser.parse_args()
 
-    run_pipeline_demo(
-        fasta_path=args.fasta,
-        chunk_size=args.chunk_size,
-        overlap=args.overlap,
-    )
+    if args.dashboard:
+        from dashboard import run_dashboard
+        run_dashboard()
+    else:
+        run_pipeline_demo(
+            fasta_path=args.fasta,
+            chunk_size=args.chunk_size,
+            overlap=args.overlap,
+        )
 
 
 if __name__ == "__main__":
     main()
-

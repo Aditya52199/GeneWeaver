@@ -1,0 +1,281 @@
+/* GeneWeaver Textual Interface Stylesheet */
+
+Screen {
+    background: #0f141c;
+    color: #e2e8f0;
+}
+
+Header {
+    background: #1a2234;
+    color: #00e5ff;
+    text-style: bold;
+    height: 1;
+    dock: top;
+}
+
+Footer {
+    background: #1a2234;
+    color: #94a3b8;
+    dock: bottom;
+    height: 1;
+}
+
+/* Tabs */
+TabbedContent {
+    background: transparent;
+    height: 1fr;
+}
+
+Tabs {
+    background: #131b2a;
+    border-bottom: solid #00e5ff;
+}
+
+Tab {
+    padding: 0 2;
+    color: #94a3b8;
+}
+
+Tab:hover {
+    color: #00e5ff;
+    background: #1a263d;
+}
+
+Tab.-active {
+    color: #00e5ff;
+    background: #1e293b;
+    text-style: bold;
+}
+
+/* Containers */
+.view-container {
+    padding: 1;
+    height: 1fr;
+    background: transparent;
+}
+
+.card {
+    background: #162032;
+    border: round #2a3b5c;
+    padding: 1;
+    margin-bottom: 1;
+}
+
+.card:focus-within {
+    border: round #00e5ff;
+}
+
+/* Stat Cards */
+.stats-grid {
+    layout: grid;
+    grid-size: 4 1;
+    grid-columns: 1fr 1fr 1fr 1fr;
+    height: 7;
+    margin-bottom: 1;
+}
+
+.stat-card {
+    background: #162032;
+    border: round #2a3b5c;
+    padding: 0 1;
+    content-align: center middle;
+    height: 100%;
+}
+
+.stat-title {
+    color: #94a3b8;
+    text-style: bold;
+    text-align: center;
+}
+
+.stat-value {
+    color: #00e5ff;
+    text-style: bold;
+    text-align: center;
+    margin-top: 1;
+}
+
+.stat-sub {
+    color: #64748b;
+    text-align: center;
+}
+
+/* Progress Section */
+.progress-container {
+    background: #162032;
+    border: round #2a3b5c;
+    padding: 1;
+    margin-bottom: 1;
+    height: auto;
+}
+
+.progress-header {
+    layout: horizontal;
+    height: 1;
+    margin-bottom: 0;
+}
+
+.progress-title {
+    color: #00e5ff;
+    text-style: bold;
+    width: 1fr;
+}
+
+.progress-detail {
+    color: #94a3b8;
+    text-align: right;
+    width: auto;
+}
+
+ProgressBar {
+    padding: 0;
+    margin: 0 0 1 0;
+    height: 1;
+}
+
+ProgressBar > .bar--bar {
+    color: #00e5ff;
+    background: #202e47;
+}
+
+ProgressBar > .bar--complete {
+    color: #00e676;
+}
+
+#chr-progress > .bar--bar {
+    color: #ff9100;
+}
+
+/* Controls Box */
+.controls-box {
+    background: #162032;
+    border: round #2a3b5c;
+    padding: 1;
+    margin-bottom: 1;
+    layout: horizontal;
+    height: 5;
+    align-vertical: middle;
+}
+
+.control-input {
+    width: 1fr;
+    margin-right: 1;
+}
+
+.control-input-sm {
+    width: 18;
+    margin-right: 1;
+}
+
+.btn-start {
+    background: #00e676;
+    color: #0a1f14;
+    text-style: bold;
+    margin-right: 1;
+}
+
+.btn-start:hover {
+    background: #69f0ae;
+}
+
+.btn-pause {
+    background: #ffab00;
+    color: #261b00;
+    text-style: bold;
+    margin-right: 1;
+}
+
+.btn-pause:hover {
+    background: #ffd740;
+}
+
+.btn-reset {
+    background: #ef4444;
+    color: #ffffff;
+    text-style: bold;
+}
+
+.btn-reset:hover {
+    background: #f87171;
+}
+
+/* Data Table */
+.table-container {
+    background: #162032;
+    border: round #2a3b5c;
+    padding: 0;
+    height: 1fr;
+}
+
+DataTable {
+    background: transparent;
+    height: 1fr;
+}
+
+DataTable > .datatable--header {
+    background: #1f2c44;
+    color: #00e5ff;
+    text-style: bold;
+}
+
+DataTable > .datatable--cursor {
+    background: #2a3b5c;
+    color: #ffffff;
+}
+
+/* Alignment View */
+.align-container {
+    layout: vertical;
+    padding: 1;
+    height: 1fr;
+}
+
+.align-input-row {
+    layout: horizontal;
+    height: 4;
+    margin-bottom: 1;
+}
+
+.align-display {
+    background: #0c1017;
+    border: round #2a3b5c;
+    padding: 1;
+    height: 1fr;
+    color: #69f0ae;
+}
+
+/* Hardware Info */
+.hw-container {
+    layout: vertical;
+    padding: 1;
+    height: 1fr;
+}
+
+.hw-card {
+    background: #162032;
+    border: round #2a3b5c;
+    padding: 1;
+    margin-bottom: 1;
+}
+
+.hw-title {
+    color: #00e5ff;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.hw-label {
+    color: #94a3b8;
+    width: 25;
+}
+
+.hw-val {
+    color: #ffffff;
+    text-style: bold;
+}
+
+.hw-row {
+    layout: horizontal;
+    height: 1;
+    margin-bottom: 1;
+}

@@ -173,11 +173,27 @@ python scripts/generate_test_data.py --output data/mock_human_genome.fasta.gz --
 
 ### 4. Run the Genomic Ingestion & Chunking Pipeline
 
-Parse the genome with BioPython and slice it into contiguous NumPy arrays:
+Parse the genome with BioPython and slice it into contiguous NumPy arrays via CLI:
 
 ```bash
 python main.py --fasta data/mock_human_genome.fasta --chunk-size 10000 --overlap 100
 ```
+
+### 5. Launch the Textual Interactive Terminal Dashboard
+
+Launch the full-screen interactive Textual terminal UI to monitor genomic chunking with live progress bars, real-time throughput telemetry, and sequence alignment:
+
+```bash
+python main.py --dashboard
+# or directly
+python -m dashboard
+```
+
+#### Dashboard Keyboard Controls:
+- `s`: **Start Chunking** (launches asynchronous background worker)
+- `p`: **Pause / Resume** chunking
+- `r`: **Reset** progress bars, counters, and table
+- `q`: **Quit** dashboard
 
 *Output summary:*
 ```text
@@ -253,7 +269,7 @@ python -m pytest tests/ -v
 - [x] Numba `@cuda.jit` anti-diagonal dynamic programming and batch CRISPR kernels.
 - [x] Host-Device memory management and bandwidth telemetry.
 - [ ] Multi-GPU scaling and Dask distributed dispatcher (`scheduler/chunk_dispatcher.py`).
-- [ ] Real-time monitoring dashboard for GPU VRAM and alignment throughput (`dashboard/`).
+- [x] Textual Terminal Interface with dual progress bars, live throughput telemetry, and chunk streaming (`dashboard/`).
 - [ ] SQLite/PostgreSQL result persistence (`storage/result_repository.py`).
 
 ---
@@ -261,3 +277,10 @@ python -m pytest tests/ -v
 ## License
 
 This project is licensed under the MIT License.
+
+
+# Option 1: Via main CLI
+python main.py --dashboard
+
+# Option 2: Directly as a module
+python -m dashboard
