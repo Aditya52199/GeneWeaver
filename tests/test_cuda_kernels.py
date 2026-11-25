@@ -8,7 +8,12 @@ DeviceManager.initialize()
 import unittest
 import numpy as np
 
-from alignment.sequence_aligner import AlignmentType, needleman_wunsch, smith_waterman
+from alignment.sequence_aligner import (
+    AlignmentType,
+    SequenceAligner,
+    needleman_wunsch,
+    smith_waterman,
+)
 from cuda_engine.gpu_matcher import CUDABatchCRISPRScanner, CUDASyncAligner
 from cuda_engine.memory_manager import MemoryManager
 from cuda_engine.sequence_encoding import decode_sequence, encode_sequence
@@ -80,6 +85,35 @@ class TestCUDAEngine(unittest.TestCase):
         self.assertEqual(gpu_res.score, cpu_res.score)
         self.assertEqual(gpu_res.seq1_aligned, "ACGT")
         self.assertEqual(gpu_res.seq2_aligned, "ACGT")
+
+    def test_cuda_semi_global_alignment(self):
+        """GPU semi-global alignment matches CPU score, traceback, and coordinates."""
+        cases = [
+            ("ACGT", "TTACGTAA"),
+            ("ACGT", "TTACGCAA"),
+            ("ACGT", "TTACGGTAA"),
+            ("ACGT", ""),
+            ("", "ACGT"),
+        ]
+
+        for seq1, seq2 in cases:
+            with self.subTest(seq1=seq1, seq2=seq2):
+                gpu_res = self.gpu_aligner.align(
+                    seq1, seq2, mode=AlignmentType.SEMI_GLOBAL
+                )
+                cpu_res = SequenceAligner().align(
+                    seq1, seq2, mode=AlignmentType.SEMI_GLOBAL
+                )
+
+                self.assertEqual(gpu_res.score, cpu_res.score)
+                self.assertEqual(gpu_res.seq1_aligned, cpu_res.seq1_aligned)
+                self.assertEqual(gpu_res.seq2_aligned, cpu_res.seq2_aligned)
+                self.assertEqual(gpu_res.start_pos, cpu_res.start_pos)
+                self.assertEqual(gpu_res.end_pos, cpu_res.end_pos)
+
+    def test_cuda_rejects_unknown_alignment_mode(self):
+        with self.assertRaises(ValueError):
+            self.gpu_aligner.align("ACGT", "ACGT", mode="unsupported")
 
     def test_cuda_batch_crispr_scanner(self):
         """Verify batch CRISPR off-target scanner detects candidate hits with PAMs."""

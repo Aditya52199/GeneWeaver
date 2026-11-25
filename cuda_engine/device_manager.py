@@ -86,10 +86,10 @@ class DeviceManager:
         if cls._is_simulator:
             return DeviceInfo(
                 device_id=0,
-                name="NVIDIA GeForce RTX 4050 Laptop GPU (CUDASIM Mode)",
-                compute_capability=(8, 9),
-                total_memory_bytes=6 * 1024 * 1024 * 1024,
-                total_memory_mb=6144.0,
+                name="Numba CUDA Simulator",
+                compute_capability=(0, 0),
+                total_memory_bytes=0,
+                total_memory_mb=0.0,
                 is_simulator=True,
             )
 

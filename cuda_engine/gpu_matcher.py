@@ -70,13 +70,20 @@ class CUDASyncAligner:
         Args:
             seq1: First sequence (query).
             seq2: Second sequence (target).
-            mode: GLOBAL (Needleman-Wunsch) or LOCAL (Smith-Waterman).
+            mode: GLOBAL, LOCAL, or SEMI_GLOBAL (free target-end gaps).
 
         Returns:
             AlignmentResult with timing, score, and alignment strings.
         """
         seq1 = seq1.strip().upper()
         seq2 = seq2.strip().upper()
+        if mode not in (
+            AlignmentType.GLOBAL,
+            AlignmentType.LOCAL,
+            AlignmentType.SEMI_GLOBAL,
+        ):
+            raise ValueError(f"Unsupported alignment mode: {mode}")
+
         m = len(seq1)
         n = len(seq2)
 
@@ -91,18 +98,17 @@ class CUDASyncAligner:
         d_seq2 = self.memory_manager.to_device(h_seq2)
 
         # Allocate DP score matrix and traceback matrix on GPU VRAM
-        d_matrix = self.memory_manager.allocate_device((m + 1, n + 1), dtype=np.int32)
-        d_traceback = self.memory_manager.allocate_device((m + 1, n + 1), dtype=np.uint8)
-
         # Step 3: Initialize Boundaries on GPU
         # Initialize row 0 and col 0 on host, then copy or initialize
         h_init_matrix = np.zeros((m + 1, n + 1), dtype=np.int32)
         h_init_tb = np.zeros((m + 1, n + 1), dtype=np.uint8)
 
-        if mode == AlignmentType.GLOBAL:
+        if mode in (AlignmentType.GLOBAL, AlignmentType.SEMI_GLOBAL):
             for i in range(1, m + 1):
                 h_init_matrix[i, 0] = i * self.gap_penalty
                 h_init_tb[i, 0] = TB_UP
+
+        if mode == AlignmentType.GLOBAL:
             for j in range(1, n + 1):
                 h_init_matrix[0, j] = j * self.gap_penalty
                 h_init_tb[0, j] = TB_LEFT
@@ -128,7 +134,7 @@ class CUDASyncAligner:
 
             blocks = (num_cells + self.threads_per_block - 1) // self.threads_per_block
 
-            if mode == AlignmentType.GLOBAL:
+            if mode in (AlignmentType.GLOBAL, AlignmentType.SEMI_GLOBAL):
                 needleman_wunsch_diag_kernel[blocks, self.threads_per_block](
                     d_seq1,
                     d_seq2,
@@ -169,6 +175,11 @@ class CUDASyncAligner:
             final_score = int(h_matrix[m, n])
             aligned1, aligned2, start_pos, end_pos = self._traceback_global(
                 seq1, seq2, h_traceback, m, n
+            )
+        elif mode == AlignmentType.SEMI_GLOBAL:
+            final_score, best_j = self._semi_global_endpoint(h_matrix, m, n)
+            aligned1, aligned2, start_pos, end_pos = self._traceback_semi_global(
+                seq1, seq2, h_traceback, m, best_j
             )
         else:
             # Find maximum score coordinates for local alignment
@@ -254,6 +265,62 @@ class CUDASyncAligner:
         aligned1.reverse()
         aligned2.reverse()
         return "".join(aligned1), "".join(aligned2), (0, 0), (m, n)
+
+    @staticmethod
+    def _semi_global_endpoint(
+        score_matrix: np.ndarray, m: int, n: int
+    ) -> Tuple[int, int]:
+        """Choose the highest-scoring cell on the final query row."""
+        best_j = n
+        best_score = int(score_matrix[m, n])
+        for j in range(1, n + 1):
+            score = int(score_matrix[m, j])
+            if score > best_score:
+                best_score = score
+                best_j = j
+        return best_score, best_j
+
+    @staticmethod
+    def _traceback_semi_global(
+        seq1: str, seq2: str, tb_matrix: np.ndarray, m: int, best_j: int
+    ) -> Tuple[str, str, Tuple[int, int], Tuple[int, int]]:
+        """Trace back from the best final-row cell, leaving target ends free."""
+        aligned1 = []
+        aligned2 = []
+        curr_i = m
+        curr_j = best_j
+
+        while curr_i > 0 and curr_j > 0:
+            direction = tb_matrix[curr_i, curr_j]
+            if direction == TB_DIAG:
+                aligned1.append(seq1[curr_i - 1])
+                aligned2.append(seq2[curr_j - 1])
+                curr_i -= 1
+                curr_j -= 1
+            elif direction == TB_UP:
+                aligned1.append(seq1[curr_i - 1])
+                aligned2.append("-")
+                curr_i -= 1
+            elif direction == TB_LEFT:
+                aligned1.append("-")
+                aligned2.append(seq2[curr_j - 1])
+                curr_j -= 1
+            else:
+                break
+
+        while curr_i > 0:
+            aligned1.append(seq1[curr_i - 1])
+            aligned2.append("-")
+            curr_i -= 1
+
+        aligned1.reverse()
+        aligned2.reverse()
+        return (
+            "".join(aligned1),
+            "".join(aligned2),
+            (curr_i, curr_j),
+            (m, best_j),
+        )
 
     @staticmethod
     def _traceback_local(
