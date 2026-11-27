@@ -137,23 +137,36 @@ def _build_candidate(
         seed_mismatches
     )
 
+    candidate_sequence = target.decode("ascii")
+    similarity = 1.0 - mismatch_count / GUIDE_LENGTH
+    predicted_score = max(0.0, 1.0 - 0.16 * mismatch_count - 0.11 * seed_mismatches)
+
     return {
         "chromosome": chunk.chromosome,
+        "start": genomic_start,
+        "end": genomic_start + WINDOW_LENGTH,
         "start_position": genomic_start,
         "end_position": genomic_start + WINDOW_LENGTH - 1,
         "strand": strand,
         "guide": guide.decode("ascii"),
-        "target": target.decode("ascii"),
+        "target": candidate_sequence,
+        "candidate": candidate_sequence,
         "pam": pam.decode("ascii"),
         "mismatch_count": mismatch_count,
         "mismatch_positions": ",".join(
             map(str, mismatch_positions)
         ),
+        "mismatch_positions_list": mismatch_positions,
         "seed_mismatches": seed_mismatches,
         "gc_content": calculate_gc_content(target),
         "candidate_score": score,
         "priority": classify_priority(score),
-        "chunk_index": chunk.chunk_index
+        "chunk_index": chunk.chunk_index,
+        "sequence_similarity": similarity,
+        "predicted_off_target_score": round(predicted_score, 6),
+        "score_model": "GeneWeaver heuristic v1 (not CFD)",
+        "engine": "cuda",
+        "experimentally_validated": False
     }
 
 
