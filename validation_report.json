@@ -1,0 +1,77 @@
+{
+    "project": "GeneWeaver",
+    "validation_type": "CPU versus selected alignment backend",
+    "generated_at_utc": "2026-11-20T15:54:37.678304+00:00",
+    "configuration": {
+        "fasta_file": "G:\\Infotact\\GeneWeaver\\sample_genome.fasta",
+        "guide_sequence": "ACGTACGTACGTACGTACGT",
+        "maximum_mismatches": 3,
+        "chunk_size": 1000,
+        "maximum_batch_starts": 5
+    },
+    "environment": {
+        "numba_cuda_imported": true,
+        "cuda_available": true,
+        "execution_backend": "CUDA",
+        "cuda_import_error": null,
+        "simulator_enabled": true,
+        "maximum_batch_starts": 65536
+    },
+    "validation_mode": "CUDA_KERNEL_VALIDATION",
+    "summary": {
+        "total_chunks": 2,
+        "passed_chunks": 2,
+        "failed_chunks": 0,
+        "overall_passed": true
+    },
+    "chunk_results": [
+        {
+            "chunk_index": 0,
+            "chromosome": "chr1_test",
+            "backend": "CUDA",
+            "validation_passed": true,
+            "cpu": {
+                "pam_sites": 5,
+                "candidate_count": 3
+            },
+            "accelerated": {
+                "pam_sites": 5,
+                "candidate_count": 3
+            },
+            "comparison": {
+                "matches": true,
+                "cpu_candidate_count": 3,
+                "accelerated_candidate_count": 3,
+                "missing_count": 0,
+                "extra_count": 0,
+                "missing_candidates": [],
+                "extra_candidates": [],
+                "pam_count_matches": true
+            }
+        },
+        {
+            "chunk_index": 0,
+            "chromosome": "chr2_test",
+            "backend": "CUDA",
+            "validation_passed": true,
+            "cpu": {
+                "pam_sites": 2,
+                "candidate_count": 2
+            },
+            "accelerated": {
+                "pam_sites": 2,
+                "candidate_count": 2
+            },
+            "comparison": {
+                "matches": true,
+                "cpu_candidate_count": 2,
+                "accelerated_candidate_count": 2,
+                "missing_count": 0,
+                "extra_count": 0,
+                "missing_candidates": [],
+                "extra_candidates": [],
+                "pam_count_matches": true
+            }
+        }
+    ]
+}
